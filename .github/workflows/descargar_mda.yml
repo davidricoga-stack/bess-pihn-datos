@@ -1,0 +1,141 @@
+name: Descargar MDA HERMOSILLO 2025-2026
+
+on:
+  workflow_dispatch:
+
+jobs:
+  descargar:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Descargar 24 meses de datos MDA
+        run: |
+          python3 << 'EOF'
+          import datetime
+          import json
+          import ssl
+          import time
+          import urllib.parse
+          import urllib.request
+          import csv
+          from concurrent.futures import ThreadPoolExecutor
+          
+          WS = "https://ws01.cenace.gob.mx:8082/SWPEND/SIM/{sis}/MDA/{zona}/{d}/{d}/JSON"
+          SISTEMA = "SIN"
+          ZONA = "HERMOSILLO"
+          ANIO_INI = 2025
+          ANIO_FIN = 2026
+          CTX = ssl.create_default_context()
+          
+          def fetch_zona(zona_id, day):
+              try:
+                  url = WS.format(sis=SISTEMA, zona=urllib.parse.quote(zona_id.replace(" ", "-")), d=day)
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                  raw = urllib.request.urlopen(req, timeout=45, context=CTX).read().decode("utf-8", "replace")
+                  j = json.loads(raw)
+                  
+                  if j.get("status") != "OK" or not j.get("Resultados"):
+                      return None, None
+                  
+                  vals = j["Resultados"][0].get("Valores", [])
+                  hourly = []
+                  
+                  for v in vals:
+                      try:
+                          hourly.append({
+                              "hora": int(v["hora"]),
+                              "pnd": round(float(v.get("pz", 0)), 2),
+                              "energia": round(float(v.get("pz_ene", 0)), 2),
+                              "perdidas": round(float(v.get("pz_per", 0)), 2),
+                              "congestion": round(float(v.get("pz_cng", 0)), 2)
+                          })
+                      except:
+                          pass
+                  
+                  if not hourly:
+                      return None, None
+                  
+                  pnds = [h["pnd"] for h in hourly if h["pnd"]]
+                  avg = round(sum(pnds) / len(pnds), 2) if pnds else None
+                  return (hourly, avg)
+              except:
+                  return None, None
+          
+          def fetch_with_retry(args):
+              zona_id, day = args
+              for attempt in range(3):
+                  try:
+                      result = fetch_zona(zona_id, day)
+                      if result != (None, None):
+                          return zona_id, day, result
+                  except:
+                      pass
+                  time.sleep(0.2)
+              return zona_id, day, (None, None)
+          
+          fecha_ini = datetime.datetime(ANIO_INI, 1, 1)
+          fecha_fin = datetime.datetime(ANIO_FIN, 12, 31)
+          
+          fechas = []
+          fecha_actual = fecha_ini
+          while fecha_actual <= fecha_fin:
+              fechas.append(fecha_actual.strftime("%Y/%m/%d"))
+              fecha_actual += datetime.timedelta(days=1)
+          
+          print(f"Descargando {len(fechas)} dias: {ZONA} {ANIO_INI}-{ANIO_FIN}")
+          print("-" * 70)
+          
+          todos_datos = {}
+          exitos = 0
+          
+          jobs = [(ZONA, day) for day in fechas]
+          
+          with ThreadPoolExecutor(max_workers=6) as executor:
+              for idx, (zona_id, day, res) in enumerate(executor.map(fetch_with_retry, jobs), 1):
+                  if res[0] is None:
+                      if idx % 100 == 0:
+                          print(f"[{idx:3d}/{len(fechas)}] {day} Esperando...")
+                  else:
+                      hourly, avg = res
+                      todos_datos[day] = {"avgPND": avg, "hourly": hourly}
+                      exitos += 1
+                      if idx % 100 == 0:
+                          print(f"[{idx:3d}/{len(fechas)}] {day} OK - {len(hourly)} registros")
+          
+          print(f"\n✓ EXITOSOS: {exitos}/{len(fechas)} dias")
+          
+          salida = "precios_pnd_hermosillo_2025_2026.csv"
+          with open(salida, 'w', newline='', encoding='utf-8') as f:
+              writer = csv.DictWriter(f, fieldnames=['fecha', 'hora', 'pnd', 'energia', 'perdidas', 'congestion'])
+              writer.writeheader()
+              
+              for day in sorted(todos_datos.keys()):
+                  for h in todos_datos[day]['hourly']:
+                      writer.writerow({
+                          'fecha': day.replace('/', '-'),
+                          'hora': h['hora'],
+                          'pnd': h['pnd'],
+                          'energia': h['energia'],
+                          'perdidas': h['perdidas'],
+                          'congestion': h['congestion']
+                      })
+          
+          print(f"✓ Guardado: {salida}")
+          
+          EOF
+      
+      - name: Upload CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: datos-mda-hermosillo
+          path: precios_pnd_hermosillo_2025_2026.csv
+          retention-days: 30
